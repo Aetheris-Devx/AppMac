@@ -493,7 +493,20 @@ function AppMac:CreateWindow(config)
 	local pal = self.Palette
 
 	-- sizing: the viewport can report 1x1 right when the script starts, so fall back to a sane size
-	local requested = config.Size or UDim2.fromOffset(640, 420)
+	-- accept {w, h}, Vector2, or UDim2 for Size (offset values are used)
+	local function toSize(s)
+		if typeof(s) == "UDim2" then
+			return s
+		elseif typeof(s) == "Vector2" then
+			return UDim2.fromOffset(s.X, s.Y)
+		elseif type(s) == "table" then
+			local w = s.X or s[1] or s.Width or 640
+			local h = s.Y or s[2] or s.Height or 420
+			return UDim2.fromOffset(w, h)
+		end
+		return UDim2.fromOffset(640, 420)
+	end
+	local requested = toSize(config.Size)
 	local function computeSizes()
 		local camera = workspace.CurrentCamera
 		local vp = camera and camera.ViewportSize or Vector2.new(0, 0)
@@ -708,7 +721,7 @@ function AppMac:CreateWindow(config)
 		Parent = content,
 	})
 
-	-- minimized "orb" (click to restore)
+	-- minimized "orb" (tap to restore, drag to move)
 	local orb = create("TextButton", {
 		Name = "Orb",
 		AnchorPoint = Vector2.new(0.5, 0.5),
@@ -733,10 +746,54 @@ function AppMac:CreateWindow(config)
 			ApplyStrokeMode = Enum.ApplyStrokeMode.Border,
 		}),
 	})
+	local orbIcon = create("ImageLabel", {
+		Name = "Icon",
+		AnchorPoint = Vector2.new(0.5, 0.5),
+		Position = UDim2.fromScale(0.5, 0.5),
+		Size = UDim2.fromOffset(22, 22),
+		BackgroundTransparency = 1,
+		ImageColor3 = pal.Text,
+		Visible = false,
+		Parent = orb,
+	})
 	self.Orb = orb
+	self.OrbIcon = orbIcon
 	self.OrbScale = create("UIScale", { Scale = 0, Parent = orb })
-	orb.MouseButton1Click:Connect(function()
-		self:Show()
+	self:SetOrbIcon(config.OrbIcon)
+
+	-- orb: short tap restores the window, drag moves the orb
+	local orbPressing, orbMoved = false, false
+	local orbPressPos, orbStartPosition
+	orb.InputBegan:Connect(function(input)
+		if isPointer(input) then
+			orbPressing = true
+			orbMoved = false
+			orbPressPos = input.Position
+			orbStartPosition = orb.Position
+		end
+	end)
+	bind(self, UserInputService.InputChanged, function(input)
+		if orbPressing and isMove(input) then
+			local delta = input.Position - orbPressPos
+			if not orbMoved and delta.Magnitude < 6 then
+				return
+			end
+			orbMoved = true
+			orb.Position = UDim2.new(
+				orbStartPosition.X.Scale,
+				orbStartPosition.X.Offset + delta.X,
+				orbStartPosition.Y.Scale,
+				orbStartPosition.Y.Offset + delta.Y
+			)
+		end
+	end)
+	bind(self, UserInputService.InputEnded, function(input)
+		if orbPressing and isPointer(input) then
+			orbPressing = false
+			if not orbMoved then
+				self:Show()
+			end
+		end
 	end)
 
 	-- dragging
@@ -800,6 +857,27 @@ function AppMac:CreateWindow(config)
 	end
 
 	return self
+end
+
+-- icon for the minimized orb:
+-- "rbxassetid://..." / "rbxasset://" / "http" = image, anything else = text (letter or emoji)
+-- nil = first letter of the title
+function Window:SetOrbIcon(icon)
+	self.OrbIconValue = icon
+	local isImage = type(icon) == "string" and (
+		string.sub(icon, 1, 13) == "rbxassetid://"
+		or string.sub(icon, 1, 9) == "rbxasset:"
+		or string.sub(icon, 1, 4) == "http"
+	)
+	if isImage then
+		self.OrbIcon.Image = icon
+		self.OrbIcon.Visible = true
+		self.Orb.Text = ""
+	else
+		self.OrbIcon.Visible = false
+		self.OrbIcon.Image = ""
+		self.Orb.Text = (type(icon) == "string" and icon ~= "") and icon or string.upper(string.sub(self.Title, 1, 1))
+	end
 end
 
 function Window:Show()
