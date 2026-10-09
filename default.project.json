@@ -1,0 +1,21 @@
+{
+  "name": "AppMac",
+  "tree": {
+    "$className": "DataModel",
+    "ReplicatedStorage": {
+      "$className": "ReplicatedStorage",
+      "AppMac": {
+        "$path": "src/AppMac.lua"
+      }
+    },
+    "StarterPlayer": {
+      "$className": "StarterPlayer",
+      "StarterPlayerScripts": {
+        "$className": "StarterPlayerScripts",
+        "AppMacExample": {
+          "$path": "examples/Example.client.lua"
+        }
+      }
+    }
+  }
+}
