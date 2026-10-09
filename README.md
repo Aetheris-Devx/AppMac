@@ -30,10 +30,11 @@ That's it! No need to install anything to ReplicatedStorage.
 ```lua
 local AppMac = loadstring(game:HttpGet("https://raw.githubusercontent.com/Aetheris-Devx/AppMac/main/src/AppMac.lua"))()
 
--- Create a window
 local Window = AppMac:CreateWindow({
 	Title = "My App",
-	Theme = "Dark", -- "Dark" or "Light"
+	Theme = "Dark",
+	ToggleKey = Enum.KeyCode.RightShift,
+	Blur = false, -- Optional background blur
 })
 
 -- Create a tab
