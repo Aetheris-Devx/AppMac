@@ -34,10 +34,6 @@ local AppMac = loadstring(game:HttpGet("https://raw.githubusercontent.com/Aether
 local Window = AppMac:CreateWindow({
 	Title = "My App",
 	Theme = "Dark", -- "Dark" or "Light"
-	Accent = Color3.fromRGB(0, 122, 255), -- Optional
-	ToggleKey = Enum.KeyCode.RightShift, -- Default
-	Blur = true, -- Optional background blur
-	Size = {800, 600}, -- Optional {width, height}
 })
 
 -- Create a tab
