@@ -1,5 +1,5 @@
 --[[
-	AppMac  -  v1.1.0
+	AppMac  -  v1.3.1
 	Minimal Apple / macOS "Liquid Glass" UI library for Roblox.
 
 	Load it from a LocalScript:
@@ -20,7 +20,7 @@ local RunService = game:GetService("RunService")
 local LocalPlayer = Players.LocalPlayer
 
 local AppMac = {}
-AppMac.Version = "1.1.0"
+AppMac.Version = "1.3.1"
 
 local Window = {}
 Window.__index = Window
@@ -34,6 +34,7 @@ Tab.__index = Tab
 
 local WINDOW_RADIUS = 18
 local SIDEBAR_WIDTH = 170
+local SIDEBAR_COLLAPSED = 80 -- icons only
 local TOPBAR_HEIGHT = 52
 local TAB_HEIGHT = 34
 local TAB_GAP = 4
@@ -375,6 +376,150 @@ local function font(weight)
 	return Font.new("rbxasset://fonts/families/GothamSSm.json", weight or Enum.FontWeight.Medium, Enum.FontStyle.Normal)
 end
 
+--------------------------------------------------------------------------------
+-- Icons
+-- Anywhere an icon is accepted you can pass either
+--   "settings", "gamepad-2", "lucide-home"     a Lucide icon name (lucide.dev)
+--   "rbxassetid://123", 123, "rbxthumb://..."  an image
+-- Lucide sprites are fetched the first time a name is used. That needs an executor
+-- (HttpGet + loadstring). Point AppMac.LucideSource at your own pinned copy, or call
+-- AppMac:SetIconProvider(fn) to supply icons yourself.
+--------------------------------------------------------------------------------
+
+AppMac.LucideSource = "https://raw.githubusercontent.com/deividcomsono/lucide-roblox-direct/refs/heads/main/source.lua"
+
+local LUCIDE_ALIASES = { home = "house", gear = "settings" }
+local iconProvider, lucideLib
+local lucideFailed, lucideLoading = false, false
+local iconRequests = setmetatable({}, { __mode = "k" }) -- [ImageLabel] = icon that was last requested
+
+local function isImageId(icon)
+	if type(icon) == "number" then
+		return true
+	end
+	return type(icon) == "string"
+		and (
+			string.sub(icon, 1, 13) == "rbxassetid://"
+			or string.sub(icon, 1, 9) == "rbxasset:"
+			or string.sub(icon, 1, 11) == "rbxthumb://"
+			or string.sub(icon, 1, 4) == "http"
+		)
+end
+
+-- normalized Lucide name for strings that look like one, otherwise nil
+local function lucideName(icon)
+	if type(icon) ~= "string" or isImageId(icon) then
+		return nil
+	end
+	local name = string.lower(icon)
+	name = string.gsub(name, "^lucide[%-:_]", "")
+	name = string.gsub(name, "[%s_]+", "-")
+	-- a single character, an emoji or ALL-CAPS initials are text, not an icon name
+	if #name < 2 or not string.match(name, "^[a-z][a-z0-9%-]*$") or not string.find(icon, "[a-z%-_ :]") then
+		return nil
+	end
+	return LUCIDE_ALIASES[name] or name
+end
+
+local function iconKind(icon)
+	if isImageId(icon) then
+		return "image"
+	elseif lucideName(icon) then
+		return "lucide"
+	end
+	return "text"
+end
+
+local function lookupAsset(name)
+	if iconProvider then
+		local ok, asset = pcall(iconProvider, name)
+		return ok and type(asset) == "table" and asset or nil
+	end
+	if not lucideLib and not lucideFailed then
+		if lucideLoading then
+			while lucideLoading do
+				task.wait()
+			end
+		else
+			lucideLoading = true
+			local ok, result = pcall(function()
+				return loadstring(game:HttpGet(AppMac.LucideSource))()
+			end)
+			lucideLoading = false
+			if ok and type(result) == "table" and type(result.GetAsset) == "function" then
+				lucideLib = result
+			else
+				lucideFailed = true
+				warn(
+					"[AppMac] Lucide icons could not be loaded (they need an executor with HttpGet and loadstring). "
+						.. "Use an rbxassetid:// icon instead, or call AppMac:SetIconProvider(fn). "
+						.. tostring(result)
+				)
+			end
+		end
+	end
+	if not lucideLib then
+		return nil
+	end
+	local ok, asset = pcall(lucideLib.GetAsset, name)
+	return ok and type(asset) == "table" and asset or nil
+end
+
+-- Puts an icon on an ImageLabel. Lucide names resolve in the background.
+-- done(found) runs once the icon is known (it is skipped if the label was reused meanwhile).
+local function loadIcon(label, icon, done)
+	iconRequests[label] = icon
+	local kind = iconKind(icon)
+	if kind == "image" then
+		label.Image = type(icon) == "number" and ("rbxassetid://" .. icon) or icon
+		label.ImageRectOffset = Vector2.zero
+		label.ImageRectSize = Vector2.zero
+		if done then
+			done(true)
+		end
+	elseif kind == "lucide" then
+		local name = lucideName(icon)
+		task.spawn(function()
+			local asset = lookupAsset(name)
+			if iconRequests[label] ~= icon or not label.Parent then
+				return
+			end
+			if asset and asset.Url then
+				label.Image = asset.Url
+				label.ImageRectOffset = asset.ImageRectOffset or Vector2.zero
+				label.ImageRectSize = asset.ImageRectSize or Vector2.zero
+				if done then
+					done(true)
+				end
+			else
+				if not lucideFailed then
+					warn('[AppMac] unknown icon "' .. tostring(icon) .. '"')
+				end
+				if done then
+					done(false)
+				end
+			end
+		end)
+	else
+		label.Image = ""
+		if done then
+			done(false)
+		end
+	end
+end
+
+-- provider: function(name) -> { Url, ImageRectSize?, ImageRectOffset? } | nil
+-- (a table with a GetAsset(name) function, like the Lucide module, also works)
+function AppMac:SetIconProvider(provider)
+	if type(provider) == "table" and type(provider.GetAsset) == "function" then
+		local source = provider
+		provider = function(name)
+			return source.GetAsset(name)
+		end
+	end
+	iconProvider = provider
+end
+
 local function decimals(n)
 	local s = tostring(n)
 	local dot = string.find(s, "%.")
@@ -692,8 +837,13 @@ end
 --   Accent    Color3                    default Apple blue
 --   ToggleKey Enum.KeyCode              default RightShift
 --   Blur      boolean                   default true
---   OrbIcon   string                    image id, text/emoji, or nil (first letter of Title)
---   Icon      string                    optional window icon (defaults to OrbIcon)
+--   OrbIcon   string                    Lucide name ("settings"), image id, text/emoji, or nil (first letter of Title)
+--   Icon      string                    optional window icon, same formats (defaults to OrbIcon)
+--   Subtitle  string                    small description under the title
+--   Collapsible boolean                 show the sidebar toggle button, default true
+--   Collapsed boolean                   start with the sidebar collapsed to icons, default false
+--   CollapseIcon string                 optional icon for the toggle button (Lucide name or image id)
+--   CollapseIconSize number             size of that icon in pixels, default 15
 --   Parent    Instance                  default PlayerGui
 function AppMac:CreateWindow(config)
 	config = config or {}
@@ -708,6 +858,9 @@ function AppMac:CreateWindow(config)
 	self.Zoomed = false
 	self.ToggleKey = config.ToggleKey or Enum.KeyCode.RightShift
 	self.UseBlur = config.Blur ~= false
+	self.Subtitle = config.Subtitle or ""
+	self.Collapsible = config.Collapsible ~= false
+	self.Collapsed = config.Collapsed == true
 	AppMac._palette = self.Palette
 
 	local pal = self.Palette
@@ -744,6 +897,8 @@ function AppMac:CreateWindow(config)
 		return UDim2.fromOffset(w, h), zoom
 	end
 	self.BaseSize, self.ZoomSize = computeSizes()
+
+	local startWidth = self.Collapsed and SIDEBAR_COLLAPSED or SIDEBAR_WIDTH
 
 	local gui = create("ScreenGui", {
 		Name = "AppMac",
@@ -793,7 +948,7 @@ function AppMac:CreateWindow(config)
 	-- sidebar
 	local sidebar = create("Frame", {
 		Name = "Sidebar",
-		Size = UDim2.new(0, SIDEBAR_WIDTH, 1, 0),
+		Size = UDim2.new(0, startWidth, 1, 0),
 		BackgroundColor3 = pal.Sidebar,
 		BackgroundTransparency = pal.SidebarTransparency,
 		BorderSizePixel = 0,
@@ -809,6 +964,8 @@ function AppMac:CreateWindow(config)
 			BorderSizePixel = 0,
 		}),
 	})
+
+	self.Sidebar = sidebar
 
 	-- traffic lights
 	local lights = create("Frame", {
@@ -903,12 +1060,13 @@ function AppMac:CreateWindow(config)
 	-- content area
 	local content = create("Frame", {
 		Name = "Content",
-		Position = UDim2.fromOffset(SIDEBAR_WIDTH, 0),
-		Size = UDim2.new(1, -SIDEBAR_WIDTH, 1, 0),
+		Position = UDim2.fromOffset(startWidth, 0),
+		Size = UDim2.new(1, -startWidth, 1, 0),
 		BackgroundTransparency = 1,
 		ZIndex = 2,
 		Parent = canvas,
 	})
+	self.Content = content
 	self.Header = create("TextLabel", {
 		Name = "Header",
 		Position = UDim2.fromOffset(24, 14),
@@ -921,12 +1079,12 @@ function AppMac:CreateWindow(config)
 		TextXAlignment = Enum.TextXAlignment.Left,
 		Parent = content,
 	})
-	-- title + icon, top right (macOS toolbar style)
+	-- title + icon, top right (macOS toolbar style). The subtitle sits under the title.
 	local titleGroup = create("Frame", {
 		Name = "TitleGroup",
 		AnchorPoint = Vector2.new(1, 0.5),
 		Position = UDim2.new(1, -18, 0, TOPBAR_HEIGHT / 2),
-		Size = UDim2.fromOffset(0, 24),
+		Size = UDim2.fromOffset(0, 34),
 		AutomaticSize = Enum.AutomaticSize.X,
 		BackgroundTransparency = 1,
 		ZIndex = 3,
@@ -940,10 +1098,27 @@ function AppMac:CreateWindow(config)
 			SortOrder = Enum.SortOrder.LayoutOrder,
 		}),
 	})
+	local titleStack = create("Frame", {
+		Name = "Text",
+		LayoutOrder = 1,
+		Size = UDim2.fromOffset(0, 0),
+		AutomaticSize = Enum.AutomaticSize.XY,
+		BackgroundTransparency = 1,
+		ZIndex = 3,
+		Parent = titleGroup,
+	}, {
+		create("UIListLayout", {
+			FillDirection = Enum.FillDirection.Vertical,
+			HorizontalAlignment = Enum.HorizontalAlignment.Right,
+			VerticalAlignment = Enum.VerticalAlignment.Center,
+			Padding = UDim.new(0, 1),
+			SortOrder = Enum.SortOrder.LayoutOrder,
+		}),
+	})
 	self.TitleLabel = create("TextLabel", {
 		Name = "Title",
 		LayoutOrder = 1,
-		Size = UDim2.fromOffset(0, 24),
+		Size = UDim2.fromOffset(0, 16),
 		AutomaticSize = Enum.AutomaticSize.X,
 		BackgroundTransparency = 1,
 		Text = self.Title,
@@ -953,9 +1128,26 @@ function AppMac:CreateWindow(config)
 		TextTransparency = 0.2,
 		TextTruncate = Enum.TextTruncate.AtEnd,
 		ZIndex = 3,
-		Parent = titleGroup,
+		Parent = titleStack,
 	}, {
-		create("UISizeConstraint", { MaxSize = Vector2.new(190, 24) }),
+		create("UISizeConstraint", { MaxSize = Vector2.new(190, 16) }),
+	})
+	self.SubtitleLabel = create("TextLabel", {
+		Name = "Subtitle",
+		LayoutOrder = 2,
+		Size = UDim2.fromOffset(0, 13),
+		AutomaticSize = Enum.AutomaticSize.X,
+		BackgroundTransparency = 1,
+		Text = self.Subtitle,
+		FontFace = font(Enum.FontWeight.Regular),
+		TextSize = 11,
+		TextColor3 = pal.SubText,
+		TextTruncate = Enum.TextTruncate.AtEnd,
+		Visible = self.Subtitle ~= "",
+		ZIndex = 3,
+		Parent = titleStack,
+	}, {
+		create("UISizeConstraint", { MaxSize = Vector2.new(190, 13) }),
 	})
 	self.IconTile = create("Frame", {
 		Name = "Icon",
@@ -1002,13 +1194,113 @@ function AppMac:CreateWindow(config)
 	})
 	-- the tab name on the left shrinks instead of running under the title
 	self.Header.TextTruncate = Enum.TextTruncate.AtEnd
+	local headerX = self.Collapsible and 52 or 24
+	self._headerX = headerX
+	self.Header.Position = UDim2.fromOffset(headerX, 14)
+	self.HeaderSub = create("TextLabel", {
+		Name = "HeaderSubtitle",
+		Position = UDim2.fromOffset(headerX, 33),
+		Size = UDim2.fromOffset(200, 14),
+		BackgroundTransparency = 1,
+		Text = "",
+		FontFace = font(Enum.FontWeight.Regular),
+		TextSize = 12,
+		TextColor3 = pal.SubText,
+		TextXAlignment = Enum.TextXAlignment.Left,
+		TextTruncate = Enum.TextTruncate.AtEnd,
+		TextTransparency = 1,
+		Parent = content,
+	})
+
+	-- sidebar toggle: collapses the tab list down to icons
+	local collapseButton = create("TextButton", {
+		Name = "Collapse",
+		Position = UDim2.fromOffset(14, TOPBAR_HEIGHT / 2 - 14),
+		Size = UDim2.fromOffset(28, 28),
+		BackgroundColor3 = pal.Element,
+		BackgroundTransparency = 1,
+		AutoButtonColor = false,
+		Text = "",
+		Visible = self.Collapsible,
+		ZIndex = 3,
+		Parent = content,
+	}, {
+		create("UICorner", { CornerRadius = UDim.new(0, 8) }),
+	})
+	local collapseScale = create("UIScale", { Parent = collapseButton })
+	self.CollapseButton = collapseButton
+	-- built-in glyph (a panel with a sidebar), used unless CollapseIcon is set
+	self.CollapseGlyph = create("Frame", {
+		Name = "Glyph",
+		AnchorPoint = Vector2.new(0.5, 0.5),
+		Position = UDim2.fromScale(0.5, 0.5),
+		Size = UDim2.fromOffset(14, 11),
+		BackgroundTransparency = 1,
+		ZIndex = 4,
+		Parent = collapseButton,
+	}, {
+		create("UICorner", { CornerRadius = UDim.new(0, 4) }),
+		create("UIStroke", {
+			Color = pal.Text,
+			Transparency = 0.35,
+			Thickness = 1.5,
+			ApplyStrokeMode = Enum.ApplyStrokeMode.Border,
+		}),
+		create("Frame", {
+			Name = "Divider",
+			Position = UDim2.fromOffset(4, 0),
+			Size = UDim2.new(0, 2, 1, 0),
+			BackgroundColor3 = pal.Text,
+			BackgroundTransparency = 0.45,
+			BorderSizePixel = 0,
+			ZIndex = 4,
+		}),
+	})
+	local iconPx = math.clamp(tonumber(config.CollapseIconSize) or 15, 8, 24)
+	self.CollapseImage = create("ImageLabel", {
+		Name = "Icon",
+		AnchorPoint = Vector2.new(0.5, 0.5),
+		Position = UDim2.fromScale(0.5, 0.5),
+		Size = UDim2.fromOffset(iconPx, iconPx),
+		BackgroundTransparency = 1,
+		ImageColor3 = pal.Text,
+		ImageTransparency = 0.2,
+		ScaleType = Enum.ScaleType.Fit,
+		Visible = false,
+		ZIndex = 4,
+		Parent = collapseButton,
+	})
+	collapseButton.MouseEnter:Connect(function()
+		play(collapseButton, T.Fast, { BackgroundTransparency = 0.9 })
+	end)
+	collapseButton.MouseLeave:Connect(function()
+		play(collapseButton, T.Fast, { BackgroundTransparency = 1 })
+		play(collapseScale, Sp.Snappy, { Scale = 1 })
+	end)
+	collapseButton.MouseButton1Down:Connect(function()
+		play(collapseScale, Sp.Snappy, { Scale = 0.88 })
+	end)
+	collapseButton.MouseButton1Up:Connect(function()
+		play(collapseScale, Sp.Snappy, { Scale = 1 })
+	end)
+	collapseButton.MouseButton1Click:Connect(function()
+		self:SetCollapsed(not self.Collapsed)
+	end)
+	if config.CollapseIcon ~= nil then
+		self:SetCollapseIcon(config.CollapseIcon)
+	end
+
 	local function fitHeader()
 		local scale = math.max(self.Scale.Scale, 0.05)
-		local free = (holder.Size.X.Offset - SIDEBAR_WIDTH) - (24 + titleGroup.AbsoluteSize.X / scale + 40)
-		self.Header.Size = UDim2.fromOffset(math.max(60, free), 28)
+		local contentWidth = holder.Size.X.Offset + content.Size.X.Offset
+		local free = contentWidth - (headerX + titleGroup.AbsoluteSize.X / scale + 40)
+		local width = math.max(60, free)
+		self.Header.Size = UDim2.fromOffset(width, 28)
+		self.HeaderSub.Size = UDim2.fromOffset(width, 14)
 	end
 	titleGroup:GetPropertyChangedSignal("AbsoluteSize"):Connect(fitHeader)
 	holder:GetPropertyChangedSignal("Size"):Connect(fitHeader)
+	content:GetPropertyChangedSignal("Size"):Connect(fitHeader)
 	fitHeader()
 
 	self.Pages = create("Frame", {
@@ -1145,7 +1437,9 @@ function AppMac:CreateWindow(config)
 
 	-- toggle key
 	bind(self, UserInputService.InputBegan, function(input, processed)
-		if not processed and not self._capturing and input.KeyCode == self.ToggleKey then
+		-- gameProcessed is true for keys the game itself binds (RightShift is Roblox's Shift Lock),
+		-- so only typing in a TextBox blocks the hotkey
+		if input.KeyCode == self.ToggleKey and not self._capturing and not UserInputService:GetFocusedTextBox() then
 			self:Toggle()
 		end
 	end)
@@ -1192,39 +1486,83 @@ function AppMac:CreateWindow(config)
 	return self
 end
 
--- true for image ids: "rbxassetid://..." / "rbxasset://..." / "http..."
-local function isImageId(icon)
-	return type(icon) == "string"
-		and (string.sub(icon, 1, 13) == "rbxassetid://" or string.sub(icon, 1, 9) == "rbxasset:" or string.sub(icon, 1, 4) == "http")
-end
-
 -- repaints the icon tile in the top-right corner of the window
 function Window:_refreshIcon()
 	local icon = self._customIcon and self.IconValue or self.OrbIconValue
-	local image = isImageId(icon)
-	self.IconImage.Visible = image
-	self.IconImage.Image = image and icon or ""
-	self.IconText.Visible = not image
-	if not image then
-		self.IconText.Text = (type(icon) == "string" and icon ~= "") and icon or string.upper(string.sub(self.Title, 1, 1))
+	local kind = iconKind(icon)
+	local letter = string.upper(string.sub(self.Title, 1, 1))
+	local tile, image = self.IconTile, self.IconImage
+
+	local function showText(text)
+		iconRequests[image] = nil
+		image.Visible = false
+		image.Image = ""
+		self.IconText.Visible = true
+		self.IconText.Text = text
+		tile.BackgroundTransparency = 0
+		self.IconGradient.Enabled = true
+		self.IconStroke.Transparency = 0.82
 	end
-	self.IconTile.BackgroundTransparency = image and 1 or 0
-	self.IconGradient.Enabled = not image
-	self.IconStroke.Transparency = image and 1 or 0.82
+
+	if kind == "image" then
+		-- a full image replaces the tile
+		self.IconText.Visible = false
+		image.Visible = true
+		image.AnchorPoint = Vector2.zero
+		image.Position = UDim2.new()
+		image.Size = UDim2.fromScale(1, 1)
+		image.ImageColor3 = Color3.new(1, 1, 1)
+		tile.BackgroundTransparency = 1
+		self.IconGradient.Enabled = false
+		self.IconStroke.Transparency = 1
+		loadIcon(image, icon)
+	elseif kind == "lucide" then
+		-- a white glyph on the accent tile; the letter shows until the icon is ready
+		showText(letter)
+		loadIcon(image, icon, function(found)
+			if self.Destroyed or (self._customIcon and self.IconValue or self.OrbIconValue) ~= icon then
+				return
+			end
+			if found then
+				self.IconText.Visible = false
+				image.Visible = true
+				image.AnchorPoint = Vector2.new(0.5, 0.5)
+				image.Position = UDim2.fromScale(0.5, 0.5)
+				image.Size = UDim2.fromOffset(14, 14)
+				image.ImageColor3 = Color3.new(1, 1, 1)
+			end
+		end)
+	else
+		showText((type(icon) == "string" and icon ~= "") and icon or letter)
+	end
 end
 
 -- icon of the minimized orb (and of the window, unless SetIcon was used):
--- "rbxassetid://..." = image, any other text = letter or emoji, nil = first letter of the title
+--   a Lucide icon name, an image id ("rbxassetid://..."), a letter / emoji, or nil (first letter of the title)
 function Window:SetOrbIcon(icon)
 	self.OrbIconValue = icon
-	if isImageId(icon) then
-		self.OrbIcon.Image = icon
-		self.OrbIcon.Visible = true
+	local letter = string.upper(string.sub(self.Title, 1, 1))
+	local kind = iconKind(icon)
+	if kind == "image" then
 		self.Orb.Text = ""
+		self.OrbIcon.Visible = true
+		loadIcon(self.OrbIcon, icon)
+	elseif kind == "lucide" then
+		-- the first letter shows until the icon is ready (or if it cannot be found)
+		self.Orb.Text = letter
+		self.OrbIcon.Visible = false
+		loadIcon(self.OrbIcon, icon, function(found)
+			if self.Destroyed or self.OrbIconValue ~= icon then
+				return
+			end
+			self.OrbIcon.Visible = found
+			self.Orb.Text = found and "" or letter
+		end)
 	else
+		iconRequests[self.OrbIcon] = nil
 		self.OrbIcon.Visible = false
 		self.OrbIcon.Image = ""
-		self.Orb.Text = (type(icon) == "string" and icon ~= "") and icon or string.upper(string.sub(self.Title, 1, 1))
+		self.Orb.Text = (type(icon) == "string" and icon ~= "") and icon or letter
 	end
 	self:_refreshIcon()
 end
@@ -1240,6 +1578,144 @@ function Window:SetTitle(text)
 	self.Title = tostring(text or "")
 	self.TitleLabel.Text = self.Title
 	self:SetOrbIcon(self.OrbIconValue)
+end
+
+function Window:SetSubtitle(text)
+	self.Subtitle = tostring(text or "")
+	self.SubtitleLabel.Text = self.Subtitle
+	self.SubtitleLabel.Visible = self.Subtitle ~= ""
+end
+
+-- re-lays one tab out for the current sidebar state (icons only when collapsed)
+function Window:_layoutTab(tab, info)
+	local collapsed = self.Collapsed
+	local base = self.ActiveTab == tab and 0 or 0.4
+	local iconShown = tab._icon ~= nil and tab._icon.Visible
+	play(tab._label, info, { TextTransparency = collapsed and 1 or base })
+	if tab._icon then
+		play(tab._icon, info, {
+			ImageTransparency = base,
+			Position = UDim2.new(0, collapsed and 22 or 11, 0.5, 0),
+		})
+	end
+	-- tabs without an icon show their first letter while collapsed
+	play(tab._glyph, info, { TextTransparency = (collapsed and not iconShown) and base or 1 })
+end
+
+-- collapse the sidebar to a column of tab icons (true) or expand it again (false)
+function Window:SetCollapsed(state, instant)
+	if self.Destroyed then
+		return
+	end
+	state = state == true
+	if state == self.Collapsed and not instant then
+		return
+	end
+	self.Collapsed = state
+	local width = state and SIDEBAR_COLLAPSED or SIDEBAR_WIDTH
+	local info = (not instant) and Sp.Smooth or nil
+	play(self.Sidebar, info, { Size = UDim2.new(0, width, 1, 0) })
+	play(self.Content, info, {
+		Position = UDim2.fromOffset(width, 0),
+		Size = UDim2.new(1, -width, 1, 0),
+	})
+	for _, tab in ipairs(self.Tabs) do
+		self:_layoutTab(tab, (not instant) and Sp.Fade or nil)
+	end
+	self:_hideTip()
+end
+
+function Window:ToggleSidebar()
+	self:SetCollapsed(not self.Collapsed)
+end
+
+-- icon of the sidebar toggle button: a Lucide name or an image id (nil = built-in glyph)
+function Window:SetCollapseIcon(icon)
+	self.CollapseIconValue = icon
+	if iconKind(icon) == "text" then
+		iconRequests[self.CollapseImage] = nil
+		self.CollapseImage.Visible = false
+		self.CollapseGlyph.Visible = true
+		return
+	end
+	loadIcon(self.CollapseImage, icon, function(found)
+		if self.Destroyed or self.CollapseIconValue ~= icon then
+			return
+		end
+		self.CollapseImage.Visible = found
+		self.CollapseGlyph.Visible = not found
+	end)
+end
+
+-- tab name tooltip, shown next to an icon while the sidebar is collapsed
+function Window:_ensureTip()
+	if self.Tip then
+		return
+	end
+	local pal = self.Palette
+	self.Tip = create("Frame", {
+		Name = "Tip",
+		AnchorPoint = Vector2.new(0, 0.5),
+		Size = UDim2.fromOffset(0, 28),
+		AutomaticSize = Enum.AutomaticSize.X,
+		BackgroundColor3 = pal.Base,
+		BackgroundTransparency = 1,
+		BorderSizePixel = 0,
+		Visible = false,
+		ZIndex = 100,
+		Parent = self.Gui,
+	}, {
+		create("UICorner", { CornerRadius = UDim.new(0, 8) }),
+		create("UIPadding", { PaddingLeft = UDim.new(0, 10), PaddingRight = UDim.new(0, 10) }),
+	})
+	self.TipStroke = create("UIStroke", {
+		Color = pal.Element,
+		Transparency = 1,
+		Thickness = 1,
+		ApplyStrokeMode = Enum.ApplyStrokeMode.Border,
+		Parent = self.Tip,
+	})
+	self.TipLabel = create("TextLabel", {
+		Size = UDim2.fromOffset(0, 28),
+		AutomaticSize = Enum.AutomaticSize.X,
+		BackgroundTransparency = 1,
+		Text = "",
+		FontFace = font(Enum.FontWeight.Medium),
+		TextSize = 13,
+		TextColor3 = pal.Text,
+		TextTransparency = 1,
+		ZIndex = 101,
+		Parent = self.Tip,
+	})
+end
+
+function Window:_showTip(tab)
+	if self.Destroyed or not self.Visible then
+		return
+	end
+	self:_ensureTip()
+	local button = tab._button
+	local pos, size = button.AbsolutePosition, button.AbsoluteSize
+	self.TipLabel.Text = tab.Name
+	self.Tip.Position = UDim2.fromOffset(pos.X + size.X + 12, pos.Y + size.Y / 2)
+	self.Tip.Visible = true
+	play(self.Tip, Sp.Fade, { BackgroundTransparency = 0.04 })
+	play(self.TipLabel, Sp.Fade, { TextTransparency = 0 })
+	play(self.TipStroke, Sp.Fade, { Transparency = 0.86 })
+end
+
+function Window:_hideTip()
+	if not self.Tip then
+		return
+	end
+	local tip = self.Tip
+	play(tip, Sp.Fade, { BackgroundTransparency = 1 }, function()
+		if tip.Parent and tip.BackgroundTransparency >= 0.99 then
+			tip.Visible = false
+		end
+	end)
+	play(self.TipLabel, Sp.Fade, { TextTransparency = 1 })
+	play(self.TipStroke, Sp.Fade, { Transparency = 1 })
 end
 
 -- un-minimize: the window grows back out of the orb
@@ -1276,6 +1752,7 @@ function Window:Hide()
 	end
 	self.Visible = false
 	local holder = self.Holder
+	self:_hideTip()
 	if self.Scale.Scale > 0.9 then
 		self._restPosition = holder.Position
 	end
@@ -1358,7 +1835,7 @@ end
 -- Tabs
 --------------------------------------------------------------------------------
 
--- config: "Name"  or  { Name = "Name", Icon = "rbxassetid://..." (optional) }
+-- config: "Name"  or  { Name = "Name", Icon = "settings" | "rbxassetid://..." (optional), Subtitle = "..." (optional) }
 function Window:CreateTab(config)
 	if type(config) == "string" then
 		config = { Name = config }
@@ -1396,33 +1873,62 @@ function Window:CreateTab(config)
 		TextTruncate = Enum.TextTruncate.AtEnd,
 		Parent = tab._button,
 	})
+	tab._glyph = create("TextLabel", {
+		AnchorPoint = Vector2.new(0, 0.5),
+		Position = UDim2.new(0, 22, 0.5, 0),
+		Size = UDim2.fromOffset(16, 16),
+		BackgroundTransparency = 1,
+		Text = string.upper(string.sub(tab.Name, 1, 1)),
+		FontFace = font(Enum.FontWeight.Bold),
+		TextSize = 14,
+		TextColor3 = pal.Text,
+		TextTransparency = 1,
+		Parent = tab._button,
+	})
+	tab.Subtitle = config.Subtitle
+
 	if config.Icon then
 		tab._icon = create("ImageLabel", {
 			AnchorPoint = Vector2.new(0, 0.5),
 			Position = UDim2.new(0, 11, 0.5, 0),
 			Size = UDim2.fromOffset(16, 16),
 			BackgroundTransparency = 1,
-			Image = config.Icon,
+			Image = "",
 			ImageColor3 = pal.Text,
 			ImageTransparency = 0.4,
 			Parent = tab._button,
 		})
+		loadIcon(tab._icon, config.Icon, function(found)
+			if not found and tab._icon.Parent then
+				-- unknown icon: give the space back to the label
+				tab._icon.Visible = false
+				tab._label.Position = UDim2.fromOffset(12, 0)
+				tab._label.Size = UDim2.new(1, -20, 1, 0)
+				self:_layoutTab(tab, nil)
+			end
+		end)
 	end
 
 	tab._button.MouseEnter:Connect(function()
+		if self.Collapsed then
+			self:_showTip(tab)
+		end
 		if self.ActiveTab ~= tab then
-			play(tab._label, T.Fast, { TextTransparency = 0.15 })
+			if not self.Collapsed then
+				play(tab._label, T.Fast, { TextTransparency = 0.15 })
+			end
 			if tab._icon then
 				play(tab._icon, T.Fast, { ImageTransparency = 0.15 })
+			end
+			if tab._glyph.TextTransparency < 1 then
+				play(tab._glyph, T.Fast, { TextTransparency = 0.15 })
 			end
 		end
 	end)
 	tab._button.MouseLeave:Connect(function()
+		self:_hideTip()
 		if self.ActiveTab ~= tab then
-			play(tab._label, T.Fast, { TextTransparency = 0.4 })
-			if tab._icon then
-				play(tab._icon, T.Fast, { ImageTransparency = 0.4 })
-			end
+			self:_layoutTab(tab, T.Fast)
 		end
 	end)
 	tab._button.MouseButton1Click:Connect(function()
@@ -1464,6 +1970,8 @@ function Window:CreateTab(config)
 		self:SelectTab(tab, true)
 	end
 
+	self:_layoutTab(tab, nil)
+
 	return tab
 end
 
@@ -1476,12 +1984,7 @@ function Window:SelectTab(tab, instant)
 	self.ActiveTab = tab
 
 	for _, other in ipairs(self.Tabs) do
-		local active = other == tab
-		local transparency = active and 0 or 0.4
-		play(other._label, T.Fast, { TextTransparency = transparency })
-		if other._icon then
-			play(other._icon, T.Fast, { ImageTransparency = transparency })
-		end
+		self:_layoutTab(other, T.Fast)
 	end
 
 	-- sliding pill
@@ -1491,6 +1994,10 @@ function Window:SelectTab(tab, instant)
 
 	-- header
 	self.Header.Text = tab.Name
+	local hasSub = tab.Subtitle ~= nil and tab.Subtitle ~= ""
+	self.HeaderSub.Text = tab.Subtitle or ""
+	play(self.Header, (not instant) and Sp.Smooth or nil, { Position = UDim2.fromOffset(self._headerX, hasSub and 8 or 14) })
+	play(self.HeaderSub, (not instant) and T.Smooth or nil, { TextTransparency = hasSub and 0 or 1 })
 	if not instant then
 		self.Header.TextTransparency = 1
 		play(self.Header, T.Smooth, { TextTransparency = 0 })
@@ -1519,6 +2026,18 @@ end
 --------------------------------------------------------------------------------
 -- Element building blocks
 --------------------------------------------------------------------------------
+
+-- change (or clear) the description under the page title
+function Tab:SetSubtitle(text)
+	self.Subtitle = text
+	local window = self.Window
+	if window.ActiveTab == self then
+		local hasSub = text ~= nil and text ~= ""
+		window.HeaderSub.Text = text or ""
+		play(window.Header, Sp.Smooth, { Position = UDim2.fromOffset(window._headerX, hasSub and 8 or 14) })
+		play(window.HeaderSub, T.Smooth, { TextTransparency = hasSub and 0 or 1 })
+	end
+end
 
 local function nextOrder(tab)
 	tab._order = tab._order + 1
@@ -2311,7 +2830,7 @@ function Tab:Keybind(config)
 			end
 			return
 		end
-		if not processed and not window._capturing and keybind.Value and input.KeyCode == keybind.Value then
+		if not window._capturing and keybind.Value and input.KeyCode == keybind.Value and not UserInputService:GetFocusedTextBox() then
 			task.spawn(safe, config.Callback)
 		end
 	end)
