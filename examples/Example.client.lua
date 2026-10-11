@@ -1,6 +1,4 @@
--- Example LocalScript. With Rojo it is mounted at StarterPlayerScripts.
--- Without Rojo: put AppMac.lua in ReplicatedStorage as a ModuleScript named "AppMac"
--- and paste this into a LocalScript under StarterPlayer > StarterPlayerScripts.
+-- Example LocalScript. Requires the ModuleScript "AppMac" in ReplicatedStorage.
 
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local AppMac = require(ReplicatedStorage:WaitForChild("AppMac"))
