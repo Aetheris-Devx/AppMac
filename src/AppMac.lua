@@ -1,5 +1,5 @@
 --[[
-	AppMac  -  v1.5.0
+	AppMac  -  v1.6.0
 	Minimal Apple / macOS "Liquid Glass" UI library for Roblox.
 
 	Load it from a LocalScript:
@@ -21,7 +21,7 @@ local TextService = game:GetService("TextService")
 local LocalPlayer = Players.LocalPlayer
 
 local AppMac = {}
-AppMac.Version = "1.5.0"
+AppMac.Version = "1.6.0"
 
 local Window = {}
 Window.__index = Window
@@ -36,6 +36,7 @@ Tab.__index = Tab
 local WINDOW_RADIUS = 18
 local SIDEBAR_WIDTH = 170
 local SIDEBAR_COLLAPSED = 80 -- icons only
+local USER_HEIGHT = 44 -- the user chip at the bottom of the sidebar
 local TOPBAR_HEIGHT = 52
 local TAB_HEIGHT = 34
 local TAB_GAP = 4
@@ -871,6 +872,8 @@ end
 --   OrbIcon   string                    Lucide name ("settings"), image id, text/emoji, or nil (first letter of Title)
 --   Icon      string                    optional window icon, same formats (defaults to OrbIcon)
 --   Subtitle  string                    small description under the title
+--   User      boolean | table           avatar + nickname at the bottom of the sidebar. true = the local player (default),
+--                                       false = hidden, or { Name, Subtitle, Image, UserId }
 --   Collapsible boolean                 show the sidebar toggle button, default true
 --   Collapsed boolean                   start with the sidebar collapsed to icons, default false
 --   CollapseIcon string                 optional icon for the toggle button (Lucide name or image id)
@@ -1065,6 +1068,7 @@ function AppMac:CreateWindow(config)
 		ScrollingDirection = Enum.ScrollingDirection.Y,
 		Parent = sidebar,
 	})
+	self.TabScroll = tabScroll
 	self.Pill = create("Frame", {
 		Name = "Pill",
 		Visible = false,
@@ -1087,6 +1091,88 @@ function AppMac:CreateWindow(config)
 	}, {
 		create("UIListLayout", { Padding = UDim.new(0, TAB_GAP), SortOrder = Enum.SortOrder.LayoutOrder }),
 	})
+
+	-- user chip: avatar + nickname at the bottom of the sidebar
+	local userChip = create("Frame", {
+		Name = "User",
+		AnchorPoint = Vector2.new(0, 1),
+		Position = UDim2.new(0, 10, 1, -10),
+		Size = UDim2.new(1, -20, 0, USER_HEIGHT),
+		BackgroundColor3 = pal.Element,
+		BackgroundTransparency = 0.94,
+		BorderSizePixel = 0,
+		Active = true,
+		Visible = false,
+		ZIndex = 3,
+		Parent = sidebar,
+	}, {
+		create("UICorner", { CornerRadius = UDim.new(0, 12) }),
+	})
+	self.UserChip = userChip
+	self.UserAvatar = create("ImageLabel", {
+		Name = "Avatar",
+		AnchorPoint = Vector2.new(0, 0.5),
+		Position = UDim2.new(0, 7, 0.5, 0),
+		Size = UDim2.fromOffset(30, 30),
+		BackgroundColor3 = pal.Element,
+		BackgroundTransparency = 0.82,
+		BorderSizePixel = 0,
+		Image = "",
+		ZIndex = 4,
+		Parent = userChip,
+	}, {
+		create("UICorner", { CornerRadius = UDim.new(1, 0) }),
+	})
+	self.UserLetter = create("TextLabel", {
+		Size = UDim2.fromScale(1, 1),
+		BackgroundTransparency = 1,
+		Text = "",
+		FontFace = font(Enum.FontWeight.Bold),
+		TextSize = 13,
+		TextColor3 = pal.Text,
+		Visible = false,
+		ZIndex = 5,
+		Parent = self.UserAvatar,
+	})
+	self.UserName = create("TextLabel", {
+		Name = "Name",
+		Position = UDim2.fromOffset(46, 7),
+		Size = UDim2.new(1, -54, 0, 16),
+		BackgroundTransparency = 1,
+		Text = "",
+		FontFace = font(Enum.FontWeight.SemiBold),
+		TextSize = 13,
+		TextColor3 = pal.Text,
+		TextXAlignment = Enum.TextXAlignment.Left,
+		TextTruncate = Enum.TextTruncate.AtEnd,
+		ZIndex = 4,
+		Parent = userChip,
+	})
+	self.UserSub = create("TextLabel", {
+		Name = "Subtitle",
+		Position = UDim2.fromOffset(46, 23),
+		Size = UDim2.new(1, -54, 0, 13),
+		BackgroundTransparency = 1,
+		Text = "",
+		FontFace = font(Enum.FontWeight.Regular),
+		TextSize = 11,
+		TextColor3 = pal.SubText,
+		TextXAlignment = Enum.TextXAlignment.Left,
+		TextTruncate = Enum.TextTruncate.AtEnd,
+		ZIndex = 4,
+		Parent = userChip,
+	})
+	userChip.MouseEnter:Connect(function()
+		play(userChip, T.Fast, { BackgroundTransparency = 0.88 })
+		if self.Collapsed and self.User then
+			self:_showTip({ _button = userChip, Name = self.User.Name })
+		end
+	end)
+	userChip.MouseLeave:Connect(function()
+		play(userChip, T.Fast, { BackgroundTransparency = 0.94 })
+		self:_hideTip()
+	end)
+	self:SetUser(config.User)
 
 	-- content area
 	local content = create("Frame", {
@@ -1716,6 +1802,7 @@ function Window:SetCollapsed(state, instant)
 	local width = state and SIDEBAR_COLLAPSED or SIDEBAR_WIDTH
 	local info = (not instant) and Sp.Smooth or nil
 	play(self.Sidebar, info, { Size = UDim2.new(0, width, 1, 0) })
+	self:_layoutUser(info and Sp.Fade or nil)
 	play(self.Content, info, {
 		Position = UDim2.fromOffset(width, 0),
 		Size = UDim2.new(1, -width, 1, 0),
@@ -1746,6 +1833,91 @@ function Window:SetCollapseIcon(icon)
 		self.CollapseImage.Visible = found
 		self.CollapseGlyph.Visible = not found
 	end)
+end
+
+-- who is shown in the user chip: nil / true = the local player, false = nobody,
+-- or { Name = "Nickname", Subtitle = "@handle", Image = "rbxassetid://..." | Lucide name, UserId = 123 }
+local function resolveUser(option)
+	if option == false then
+		return nil
+	end
+	local config = type(option) == "table" and option or {}
+	local userId = tonumber(config.UserId) or LocalPlayer.UserId
+	local own = userId == LocalPlayer.UserId
+	local user = { UserId = userId }
+	if config.Name ~= nil then
+		user.Name = tostring(config.Name)
+	elseif own then
+		user.Name = LocalPlayer.DisplayName
+	else
+		user.Name = "..."
+		user.NamePending = true
+	end
+	if config.Subtitle ~= nil then
+		user.Subtitle = tostring(config.Subtitle)
+	elseif own then
+		user.Subtitle = "@" .. LocalPlayer.Name
+	else
+		user.Subtitle = ""
+		user.SubtitleFromName = true
+	end
+	user.Image = config.Image or string.format("rbxthumb://type=AvatarHeadShot&id=%d&w=150&h=150", userId)
+	return user
+end
+
+-- user chip at the bottom of the sidebar (avatar + nickname). true / nil = the local player, false = hide,
+-- or a table: { Name, Subtitle, Image, UserId }
+function Window:SetUser(option)
+	self.User = resolveUser(option)
+	self:_refreshUser()
+end
+
+function Window:_refreshUser()
+	local user = self.User
+	self.UserChip.Visible = user ~= nil
+	-- the tab list leaves room for the chip
+	self.TabScroll.Size = UDim2.new(1, -20, 1, -(54 + (user and (USER_HEIGHT + 18) or 10)))
+	if not user then
+		return
+	end
+	self.UserName.Text = user.Name
+	self.UserSub.Text = user.Subtitle
+	self.UserSub.Visible = user.Subtitle ~= ""
+	self.UserLetter.Text = string.upper(string.sub(user.Name, 1, 1))
+	loadIcon(self.UserAvatar, user.Image, function(found)
+		if self.Destroyed or self.User ~= user then
+			return
+		end
+		self.UserLetter.Visible = not found
+	end)
+	self:_layoutUser(nil)
+	if user.NamePending then
+		task.spawn(function()
+			local ok, name = pcall(Players.GetNameFromUserIdAsync, Players, user.UserId)
+			if ok and not self.Destroyed and self.User == user then
+				user.Name = name
+				if user.SubtitleFromName then
+					user.Subtitle = "@" .. name
+				end
+				user.NamePending = nil
+				self.UserName.Text = user.Name
+				self.UserSub.Text = user.Subtitle
+				self.UserSub.Visible = user.Subtitle ~= ""
+				self.UserLetter.Text = string.upper(string.sub(name, 1, 1))
+			end
+		end)
+	end
+end
+
+-- avatar only while the sidebar is collapsed
+function Window:_layoutUser(info)
+	if not self.User then
+		return
+	end
+	local collapsed = self.Collapsed
+	play(self.UserAvatar, info, { Position = UDim2.new(0, collapsed and 15 or 7, 0.5, 0) })
+	play(self.UserName, info, { TextTransparency = collapsed and 1 or 0 })
+	play(self.UserSub, info, { TextTransparency = collapsed and 1 or 0.35 })
 end
 
 -- tab name tooltip, shown next to an icon while the sidebar is collapsed
