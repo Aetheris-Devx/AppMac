@@ -1,9 +1,11 @@
 --[[
-	AppMac  -  v1.0.0
+	AppMac  -  v1.1.0
 	Minimal Apple / macOS "Liquid Glass" UI library for Roblox.
 
-	Place this file as a ModuleScript (e.g. ReplicatedStorage.AppMac) and
-	require it from a LocalScript. See README.md and examples/Example.client.lua.
+	Load it from a LocalScript:
+		local AppMac = loadstring(game:HttpGet("https://raw.githubusercontent.com/Aetheris-Devx/AppMac/main/src/AppMac.lua"))()
+	or place this file as a ModuleScript (e.g. ReplicatedStorage.AppMac) and require it.
+	See README.md and examples/Example.client.lua.
 
 	Elements:  Section, Label, Paragraph, Button, Toggle, Slider,
 	           Dropdown, Input, Keybind, Notify
@@ -13,11 +15,12 @@ local Players = game:GetService("Players")
 local TweenService = game:GetService("TweenService")
 local UserInputService = game:GetService("UserInputService")
 local Lighting = game:GetService("Lighting")
+local RunService = game:GetService("RunService")
 
 local LocalPlayer = Players.LocalPlayer
 
 local AppMac = {}
-AppMac.Version = "1.0.0"
+AppMac.Version = "1.1.0"
 
 local Window = {}
 Window.__index = Window
@@ -41,11 +44,22 @@ local TAB_STRIDE = TAB_HEIGHT + TAB_GAP
 --------------------------------------------------------------------------------
 
 local T = {
-	Fast = TweenInfo.new(0.16, Enum.EasingStyle.Quad, Enum.EasingDirection.Out),
-	Smooth = TweenInfo.new(0.38, Enum.EasingStyle.Quint, Enum.EasingDirection.Out),
+	Fast = TweenInfo.new(0.15, Enum.EasingStyle.Sine, Enum.EasingDirection.Out),
+	Smooth = TweenInfo.new(0.4, Enum.EasingStyle.Exponential, Enum.EasingDirection.Out),
 	Spring = TweenInfo.new(0.5, Enum.EasingStyle.Back, Enum.EasingDirection.Out),
-	In = TweenInfo.new(0.24, Enum.EasingStyle.Quint, Enum.EasingDirection.In),
-	Drag = TweenInfo.new(0.08, Enum.EasingStyle.Quad, Enum.EasingDirection.Out),
+	In = TweenInfo.new(0.22, Enum.EasingStyle.Quart, Enum.EasingDirection.In),
+	Drag = TweenInfo.new(0.06, Enum.EasingStyle.Sine, Enum.EasingDirection.Out),
+}
+
+-- Springs (macOS-style motion). w = speed (angular frequency), z = damping (1 = no overshoot).
+local Sp = {
+	Window = { Spring = true, w = 17, z = 0.86 }, -- open, un-minimize
+	Smooth = { Spring = true, w = 15, z = 1 }, -- resize, zoom, dropdowns
+	Close = { Spring = true, w = 20, z = 1 }, -- minimize, dismiss
+	Fade = { Spring = true, w = 24, z = 1 }, -- opacity
+	Snappy = { Spring = true, w = 34, z = 0.88 }, -- toggles, press states
+	Soft = { Spring = true, w = 26, z = 0.8 }, -- sliding tab pill
+	Pop = { Spring = true, w = 24, z = 0.56 }, -- the orb
 }
 
 --------------------------------------------------------------------------------
@@ -127,23 +141,6 @@ local function create(class, props, children)
 	return inst
 end
 
-local function apply(obj, props)
-	for key, value in pairs(props) do
-		obj[key] = value
-	end
-end
-
--- play(obj, nil, props) applies instantly, otherwise tweens.
-local function play(obj, info, props)
-	if not info then
-		apply(obj, props)
-		return nil
-	end
-	local tween = TweenService:Create(obj, info, props)
-	tween:Play()
-	return tween
-end
-
 local function safe(fn, ...)
 	if type(fn) ~= "function" then
 		return
@@ -152,6 +149,226 @@ local function safe(fn, ...)
 	if not ok then
 		warn("[AppMac] callback error: " .. tostring(err))
 	end
+end
+
+--------------------------------------------------------------------------------
+-- Spring engine
+-- Interruptible, velocity-preserving motion. A new spring on a property that is
+-- already moving keeps its current velocity, so reversing a window mid-animation
+-- never jumps or stutters (this is what makes macOS feel fluid).
+--------------------------------------------------------------------------------
+
+local springs = {} -- [instance] = { [property] = record }
+local tweenRegistry = setmetatable({}, { __mode = "k" }) -- [instance] = { [property] = tween }
+local frameConnection
+
+local function toArray(value)
+	local kind = typeof(value)
+	if kind == "number" then
+		return { value }, 1
+	elseif kind == "UDim2" then
+		return { value.X.Scale, value.X.Offset, value.Y.Scale, value.Y.Offset }, 2
+	elseif kind == "Vector2" then
+		return { value.X, value.Y }, 3
+	elseif kind == "Color3" then
+		return { value.R, value.G, value.B }, 4
+	end
+	return nil, 0
+end
+
+local function fromArray(a, kind, clamp)
+	if kind == 1 then
+		return clamp and math.clamp(a[1], 0, 1) or a[1]
+	elseif kind == 2 then
+		return UDim2.new(a[1], a[2], a[3], a[4])
+	elseif kind == 3 then
+		return Vector2.new(a[1], a[2])
+	end
+	return Color3.new(math.clamp(a[1], 0, 1), math.clamp(a[2], 0, 1), math.clamp(a[3], 0, 1))
+end
+
+local EPSILON = {
+	{ 0.0008 },
+	{ 0.0004, 0.04, 0.0004, 0.04 },
+	{ 0.04, 0.04 },
+	{ 0.002, 0.002, 0.002 },
+}
+
+-- exact solution of a damped harmonic oscillator over dt (stable at any frame rate)
+local function stepComponent(x, v, target, w, z, dt)
+	local d = x - target
+	if z >= 0.9999 then
+		local e = math.exp(-w * dt)
+		local b = v + w * d
+		return target + e * (d + b * dt), e * (v - w * b * dt)
+	end
+	local c = z * w
+	local wd = w * math.sqrt(1 - z * z)
+	local e = math.exp(-c * dt)
+	local cs, sn = math.cos(wd * dt), math.sin(wd * dt)
+	return target + e * (d * cs + ((v + c * d) / wd) * sn), e * (v * cs - ((v * c + d * w * w) / wd) * sn)
+end
+
+local function onFrame(dt)
+	if dt > 0.05 then
+		dt = 0.05
+	end
+	local finished
+	for obj, set in pairs(springs) do
+		if not obj:IsDescendantOf(game) then
+			springs[obj] = nil
+		else
+			for prop, rec in pairs(set) do
+				local x, v, t, eps = rec.x, rec.v, rec.t, EPSILON[rec.kind]
+				local settled = true
+				for i = 1, #x do
+					x[i], v[i] = stepComponent(x[i], v[i], t[i], rec.w, rec.z, dt)
+					if math.abs(x[i] - t[i]) > eps[i] or math.abs(v[i]) > eps[i] * 25 then
+						settled = false
+					end
+				end
+				if settled then
+					obj[prop] = fromArray(t, rec.kind, rec.clamp)
+					set[prop] = nil
+					local group = rec.group
+					group.left = group.left - 1
+					if group.left == 0 and group.done then
+						finished = finished or {}
+						table.insert(finished, group.done)
+					end
+				else
+					obj[prop] = fromArray(x, rec.kind, rec.clamp)
+				end
+			end
+			if next(set) == nil then
+				springs[obj] = nil
+			end
+		end
+	end
+	-- completion callbacks run after the loop (they may start new springs)
+	if finished then
+		for _, fn in ipairs(finished) do
+			safe(fn)
+		end
+	end
+	if next(springs) == nil and frameConnection then
+		frameConnection:Disconnect()
+		frameConnection = nil
+	end
+end
+
+local function springTo(obj, info, props, done)
+	local set = springs[obj]
+	if not set then
+		set = {}
+		springs[obj] = set
+	end
+	local registry = tweenRegistry[obj]
+	local group = { left = 0, done = done }
+	for prop, target in pairs(props) do
+		if registry and registry[prop] then
+			registry[prop]:Cancel()
+			registry[prop] = nil
+		end
+		local t, kind = toArray(target)
+		if not t then
+			obj[prop] = target
+			set[prop] = nil
+		else
+			local old = set[prop]
+			local x, v
+			if old then
+				x, v = old.x, old.v
+			else
+				x = toArray(obj[prop])
+				v = table.create(#x, 0)
+			end
+			set[prop] = {
+				kind = kind,
+				x = x,
+				v = v,
+				t = t,
+				w = info.w,
+				z = info.z,
+				group = group,
+				clamp = string.find(prop, "Transparency", 1, true) ~= nil,
+			}
+			group.left = group.left + 1
+		end
+	end
+	if group.left == 0 then
+		if next(set) == nil then
+			springs[obj] = nil
+		end
+		if done then
+			task.spawn(safe, done)
+		end
+	elseif not frameConnection then
+		local signal = RunService:IsClient() and RunService.RenderStepped or RunService.Heartbeat
+		frameConnection = signal:Connect(onFrame)
+	end
+end
+
+-- stop any running spring / tween on one property (used when the user grabs something)
+local function halt(obj, prop)
+	local set = springs[obj]
+	if set then
+		set[prop] = nil
+	end
+	local registry = tweenRegistry[obj]
+	if registry and registry[prop] then
+		registry[prop]:Cancel()
+		registry[prop] = nil
+	end
+end
+
+local function apply(obj, props)
+	for key, value in pairs(props) do
+		halt(obj, key)
+		obj[key] = value
+	end
+end
+
+-- play(obj, nil, props)   applies instantly
+-- play(obj, T.x, props)   tweens
+-- play(obj, Sp.x, props)  springs. Optional done() fires when everything settled
+--                         (it never fires if the motion gets interrupted).
+local function play(obj, info, props, done)
+	if not info then
+		apply(obj, props)
+		if done then
+			task.spawn(safe, done)
+		end
+		return nil
+	end
+	if type(info) == "table" then -- spring preset (TweenInfo is userdata)
+		springTo(obj, info, props, done)
+		return nil
+	end
+	local set = springs[obj]
+	if set then
+		for key in pairs(props) do
+			set[key] = nil
+		end
+	end
+	local tween = TweenService:Create(obj, info, props)
+	local registry = tweenRegistry[obj]
+	if not registry then
+		registry = {}
+		tweenRegistry[obj] = registry
+	end
+	for key in pairs(props) do
+		registry[key] = tween
+	end
+	if done then
+		tween.Completed:Once(function(state)
+			if state == Enum.PlaybackState.Completed then
+				done()
+			end
+		end)
+	end
+	tween:Play()
+	return tween
 end
 
 local function font(weight)
@@ -429,16 +646,16 @@ function AppMac:Notify(config, palette)
 			return
 		end
 		closed = true
-		play(card, T.In, { Position = UDim2.new(0, 340, 0, 0), GroupTransparency = 1 })
-		task.delay(0.26, function()
+		play(card, Sp.Close, { Position = UDim2.new(0, 340, 0, 0) })
+		play(card, Sp.Fade, { GroupTransparency = 1 })
+		task.delay(0.2, function()
 			if not wrapper.Parent then
 				return
 			end
 			local height = wrapper.AbsoluteSize.Y
 			wrapper.AutomaticSize = Enum.AutomaticSize.None
 			wrapper.Size = UDim2.new(1, 0, 0, height)
-			play(wrapper, T.Smooth, { Size = UDim2.new(1, 0, 0, 0) })
-			task.delay(0.4, function()
+			play(wrapper, Sp.Smooth, { Size = UDim2.new(1, 0, 0, 0) }, function()
 				if wrapper.Parent then
 					wrapper:Destroy()
 				end
@@ -456,7 +673,8 @@ function AppMac:Notify(config, palette)
 	})
 	dismiss.MouseButton1Click:Connect(close)
 
-	play(card, T.Smooth, { Position = UDim2.new(0, 0, 0, 0), GroupTransparency = 0 })
+	play(card, Sp.Window, { Position = UDim2.new(0, 0, 0, 0) })
+	play(card, Sp.Fade, { GroupTransparency = 0 })
 	play(bar, TweenInfo.new(duration, Enum.EasingStyle.Linear), { Size = UDim2.new(0, 0, 0, 2) })
 	task.delay(duration, close)
 
@@ -469,11 +687,13 @@ end
 
 -- config:
 --   Title     string
---   Size      UDim2 (offset)           default 640 x 420
+--   Size      {w, h} | Vector2 | UDim2   default {560, 430}
 --   Theme     "Dark" | "Light"          default "Dark"
 --   Accent    Color3                    default Apple blue
 --   ToggleKey Enum.KeyCode              default RightShift
 --   Blur      boolean                   default true
+--   OrbIcon   string                    image id, text/emoji, or nil (first letter of Title)
+--   Icon      string                    optional window icon (defaults to OrbIcon)
 --   Parent    Instance                  default PlayerGui
 function AppMac:CreateWindow(config)
 	config = config or {}
@@ -500,11 +720,11 @@ function AppMac:CreateWindow(config)
 		elseif typeof(s) == "Vector2" then
 			return UDim2.fromOffset(s.X, s.Y)
 		elseif type(s) == "table" then
-			local w = s.X or s[1] or s.Width or 640
-			local h = s.Y or s[2] or s.Height or 420
+			local w = s.X or s[1] or s.Width or 560
+			local h = s.Y or s[2] or s.Height or 430
 			return UDim2.fromOffset(w, h)
 		end
-		return UDim2.fromOffset(640, 420)
+		return UDim2.fromOffset(560, 430)
 	end
 	local requested = toSize(config.Size)
 	local function computeSizes()
@@ -513,8 +733,10 @@ function AppMac:CreateWindow(config)
 		if vp.X < 200 or vp.Y < 200 then
 			vp = Vector2.new(1280, 720)
 		end
-		local w = math.max(280, math.min(requested.X.Offset, vp.X - 24))
-		local h = math.max(240, math.min(requested.Y.Offset, vp.Y - 24))
+		local rw = requested.X.Offset + requested.X.Scale * vp.X
+		local rh = requested.Y.Offset + requested.Y.Scale * vp.Y
+		local w = math.max(280, math.min(rw, vp.X - 24))
+		local h = math.max(240, math.min(rh, vp.Y - 24))
 		local zoom = UDim2.fromOffset(
 			math.max(w, math.min(vp.X * 0.88, 1000)),
 			math.max(h, math.min(vp.Y * 0.88, 700))
@@ -642,25 +864,11 @@ function AppMac:CreateWindow(config)
 		end
 	end)
 
-	-- title
-	create("TextLabel", {
-		Position = UDim2.fromOffset(18, 44),
-		Size = UDim2.new(1, -36, 0, 16),
-		BackgroundTransparency = 1,
-		Text = string.upper(self.Title),
-		FontFace = font(Enum.FontWeight.SemiBold),
-		TextSize = 11,
-		TextColor3 = pal.SubText,
-		TextXAlignment = Enum.TextXAlignment.Left,
-		TextTruncate = Enum.TextTruncate.AtEnd,
-		Parent = sidebar,
-	})
-
 	-- tab list + sliding selection pill
 	local tabScroll = create("ScrollingFrame", {
 		Name = "Tabs",
-		Position = UDim2.new(0, 10, 0, 68),
-		Size = UDim2.new(1, -20, 1, -80),
+		Position = UDim2.new(0, 10, 0, 54),
+		Size = UDim2.new(1, -20, 1, -64),
 		BackgroundTransparency = 1,
 		BorderSizePixel = 0,
 		ScrollBarThickness = 0,
@@ -671,6 +879,7 @@ function AppMac:CreateWindow(config)
 	})
 	self.Pill = create("Frame", {
 		Name = "Pill",
+		Visible = false,
 		Size = UDim2.new(1, 0, 0, TAB_HEIGHT),
 		BackgroundColor3 = pal.Element,
 		BackgroundTransparency = 0.88,
@@ -712,6 +921,96 @@ function AppMac:CreateWindow(config)
 		TextXAlignment = Enum.TextXAlignment.Left,
 		Parent = content,
 	})
+	-- title + icon, top right (macOS toolbar style)
+	local titleGroup = create("Frame", {
+		Name = "TitleGroup",
+		AnchorPoint = Vector2.new(1, 0.5),
+		Position = UDim2.new(1, -18, 0, TOPBAR_HEIGHT / 2),
+		Size = UDim2.fromOffset(0, 24),
+		AutomaticSize = Enum.AutomaticSize.X,
+		BackgroundTransparency = 1,
+		ZIndex = 3,
+		Parent = content,
+	}, {
+		create("UIListLayout", {
+			FillDirection = Enum.FillDirection.Horizontal,
+			HorizontalAlignment = Enum.HorizontalAlignment.Right,
+			VerticalAlignment = Enum.VerticalAlignment.Center,
+			Padding = UDim.new(0, 8),
+			SortOrder = Enum.SortOrder.LayoutOrder,
+		}),
+	})
+	self.TitleLabel = create("TextLabel", {
+		Name = "Title",
+		LayoutOrder = 1,
+		Size = UDim2.fromOffset(0, 24),
+		AutomaticSize = Enum.AutomaticSize.X,
+		BackgroundTransparency = 1,
+		Text = self.Title,
+		FontFace = font(Enum.FontWeight.SemiBold),
+		TextSize = 13,
+		TextColor3 = pal.Text,
+		TextTransparency = 0.2,
+		TextTruncate = Enum.TextTruncate.AtEnd,
+		ZIndex = 3,
+		Parent = titleGroup,
+	}, {
+		create("UISizeConstraint", { MaxSize = Vector2.new(190, 24) }),
+	})
+	self.IconTile = create("Frame", {
+		Name = "Icon",
+		LayoutOrder = 2,
+		Size = UDim2.fromOffset(22, 22),
+		BackgroundColor3 = Color3.new(1, 1, 1),
+		BorderSizePixel = 0,
+		ClipsDescendants = true,
+		ZIndex = 3,
+		Parent = titleGroup,
+	}, {
+		create("UICorner", { CornerRadius = UDim.new(0, 6) }),
+	})
+	self.IconGradient = create("UIGradient", {
+		Rotation = 90,
+		Color = ColorSequence.new(pal.Accent:Lerp(Color3.new(1, 1, 1), 0.3), pal.Accent),
+		Parent = self.IconTile,
+	})
+	self.IconStroke = create("UIStroke", {
+		Color = Color3.new(1, 1, 1),
+		Transparency = 0.82,
+		Thickness = 1,
+		ApplyStrokeMode = Enum.ApplyStrokeMode.Border,
+		Parent = self.IconTile,
+	})
+	self.IconText = create("TextLabel", {
+		Size = UDim2.fromScale(1, 1),
+		BackgroundTransparency = 1,
+		Text = "",
+		FontFace = font(Enum.FontWeight.Bold),
+		TextSize = 13,
+		TextColor3 = Color3.new(1, 1, 1),
+		ZIndex = 4,
+		Parent = self.IconTile,
+	})
+	self.IconImage = create("ImageLabel", {
+		Size = UDim2.fromScale(1, 1),
+		BackgroundTransparency = 1,
+		Image = "",
+		ScaleType = Enum.ScaleType.Fit,
+		Visible = false,
+		ZIndex = 4,
+		Parent = self.IconTile,
+	})
+	-- the tab name on the left shrinks instead of running under the title
+	self.Header.TextTruncate = Enum.TextTruncate.AtEnd
+	local function fitHeader()
+		local scale = math.max(self.Scale.Scale, 0.05)
+		local free = (holder.Size.X.Offset - SIDEBAR_WIDTH) - (24 + titleGroup.AbsoluteSize.X / scale + 40)
+		self.Header.Size = UDim2.fromOffset(math.max(60, free), 28)
+	end
+	titleGroup:GetPropertyChangedSignal("AbsoluteSize"):Connect(fitHeader)
+	holder:GetPropertyChangedSignal("Size"):Connect(fitHeader)
+	fitHeader()
+
 	self.Pages = create("Frame", {
 		Name = "Pages",
 		Position = UDim2.fromOffset(0, TOPBAR_HEIGHT),
@@ -760,8 +1059,11 @@ function AppMac:CreateWindow(config)
 	self.OrbIcon = orbIcon
 	self.OrbScale = create("UIScale", { Scale = 0, Parent = orb })
 	self:SetOrbIcon(config.OrbIcon)
+	if config.Icon ~= nil then
+		self:SetIcon(config.Icon)
+	end
 
-	-- orb: short tap restores the window, drag moves the orb
+	-- orb: tap restores the window, drag moves the orb (it never leaves the screen)
 	local orbPressing, orbMoved = false, false
 	local orbPressPos, orbStartPosition
 	orb.InputBegan:Connect(function(input)
@@ -770,6 +1072,7 @@ function AppMac:CreateWindow(config)
 			orbMoved = false
 			orbPressPos = input.Position
 			orbStartPosition = orb.Position
+			play(self.OrbScale, Sp.Snappy, { Scale = 0.9 })
 		end
 	end)
 	bind(self, UserInputService.InputChanged, function(input)
@@ -779,78 +1082,108 @@ function AppMac:CreateWindow(config)
 				return
 			end
 			orbMoved = true
-			orb.Position = UDim2.new(
-				orbStartPosition.X.Scale,
-				orbStartPosition.X.Offset + delta.X,
-				orbStartPosition.Y.Scale,
-				orbStartPosition.Y.Offset + delta.Y
+			local vp = gui.AbsoluteSize
+			local cx = orbStartPosition.X.Scale * vp.X + orbStartPosition.X.Offset + delta.X
+			local cy = orbStartPosition.Y.Scale * vp.Y + orbStartPosition.Y.Offset + delta.Y
+			orb.Position = UDim2.fromOffset(
+				math.clamp(cx, 22, math.max(22, vp.X - 22)),
+				math.clamp(cy, 22, math.max(22, vp.Y - 22))
 			)
 		end
 	end)
 	bind(self, UserInputService.InputEnded, function(input)
 		if orbPressing and isPointer(input) then
 			orbPressing = false
-			if not orbMoved then
+			if not orbMoved and not self.Visible then
 				self:Show()
+			else
+				play(self.OrbScale, Sp.Pop, { Scale = self.Visible and 0 or 1 })
 			end
 		end
 	end)
 
-	-- dragging
+	-- window drag: 1:1 with the pointer, always keeps the title bar reachable,
+	-- double-click the bar to zoom (like macOS)
 	local dragging = false
 	local dragStart, startPosition
+	local lastClick, lastClickPos = 0, Vector3.zero
 	dragBar.InputBegan:Connect(function(input)
-		if isPointer(input) then
-			dragging = true
-			dragStart = input.Position
-			startPosition = holder.Position
-			play(self.Scale, T.Fast, { Scale = 0.992 })
+		if not isPointer(input) then
+			return
 		end
+		local now = os.clock()
+		if now - lastClick < 0.35 and (input.Position - lastClickPos).Magnitude < 10 then
+			lastClick = 0
+			dragging = false
+			self:ToggleZoom()
+			return
+		end
+		lastClick = now
+		lastClickPos = input.Position
+		dragging = true
+		dragStart = input.Position
+		startPosition = holder.Position
+		halt(holder, "Position")
 	end)
 	bind(self, UserInputService.InputChanged, function(input)
 		if dragging and isMove(input) then
 			local delta = input.Position - dragStart
-			play(holder, T.Drag, {
-				Position = UDim2.new(
-					startPosition.X.Scale,
-					startPosition.X.Offset + delta.X,
-					startPosition.Y.Scale,
-					startPosition.Y.Offset + delta.Y
-				),
-			})
+			local vp = gui.AbsoluteSize
+			local size = holder.AbsoluteSize
+			local cx = startPosition.X.Scale * vp.X + startPosition.X.Offset + delta.X
+			local cy = startPosition.Y.Scale * vp.Y + startPosition.Y.Offset + delta.Y
+			cx = math.clamp(cx, 80 - size.X / 2, math.max(80 - size.X / 2, vp.X - 80 + size.X / 2))
+			cy = math.clamp(cy, size.Y / 2, math.max(size.Y / 2, vp.Y - 56 + size.Y / 2))
+			holder.Position = UDim2.fromOffset(cx, cy)
 		end
 	end)
 	bind(self, UserInputService.InputEnded, function(input)
 		if dragging and isPointer(input) then
 			dragging = false
-			play(self.Scale, T.Spring, { Scale = 1 })
 		end
 	end)
 
 	-- toggle key
 	bind(self, UserInputService.InputBegan, function(input, processed)
-		if not processed and input.KeyCode == self.ToggleKey then
+		if not processed and not self._capturing and input.KeyCode == self.ToggleKey then
 			self:Toggle()
 		end
 	end)
 
 	local function refit()
-		if self.Destroyed or self.Zoomed then
+		if self.Destroyed then
 			return
 		end
 		self.BaseSize, self.ZoomSize = computeSizes()
-		play(holder, T.Smooth, { Size = self.BaseSize })
+		play(holder, Sp.Smooth, { Size = self.Zoomed and self.ZoomSize or self.BaseSize })
 	end
-	local cam = workspace.CurrentCamera
-	if cam then
-		bind(self, cam:GetPropertyChangedSignal("ViewportSize"), refit)
+	local cameraConnection
+	local function watchCamera()
+		if cameraConnection then
+			cameraConnection:Disconnect()
+		end
+		local cam = workspace.CurrentCamera
+		if cam then
+			cameraConnection = cam:GetPropertyChangedSignal("ViewportSize"):Connect(refit)
+			table.insert(self.Connections, cameraConnection)
+		end
+		refit()
 	end
+	bind(self, workspace:GetPropertyChangedSignal("CurrentCamera"), watchCamera)
+	watchCamera()
 
 	-- mount + open animation
+	canvas.GroupTransparency = 1
 	gui.Parent = config.Parent or LocalPlayer:WaitForChild("PlayerGui")
-	play(self.Scale, T.Smooth, { Scale = 1 })
-	play(canvas, T.Smooth, { GroupTransparency = 0 })
-	setShadow(self.Shadow, pal, true, T.Smooth)
+	play(self.Scale, Sp.Window, { Scale = 1 })
+	play(canvas, Sp.Fade, { GroupTransparency = 0 })
+	setShadow(self.Shadow, pal, true, Sp.Fade)
+	-- safety net: never leave the window invisible
+	task.delay(1.2, function()
+		if not self.Destroyed and self.Visible and canvas.Parent then
+			canvas.GroupTransparency = 0
+		end
+	end)
 	if self.UseBlur then
 		blurUsers[self] = true
 		refreshBlur()
@@ -859,17 +1192,32 @@ function AppMac:CreateWindow(config)
 	return self
 end
 
--- icon for the minimized orb:
--- "rbxassetid://..." / "rbxasset://" / "http" = image, anything else = text (letter or emoji)
--- nil = first letter of the title
+-- true for image ids: "rbxassetid://..." / "rbxasset://..." / "http..."
+local function isImageId(icon)
+	return type(icon) == "string"
+		and (string.sub(icon, 1, 13) == "rbxassetid://" or string.sub(icon, 1, 9) == "rbxasset:" or string.sub(icon, 1, 4) == "http")
+end
+
+-- repaints the icon tile in the top-right corner of the window
+function Window:_refreshIcon()
+	local icon = self._customIcon and self.IconValue or self.OrbIconValue
+	local image = isImageId(icon)
+	self.IconImage.Visible = image
+	self.IconImage.Image = image and icon or ""
+	self.IconText.Visible = not image
+	if not image then
+		self.IconText.Text = (type(icon) == "string" and icon ~= "") and icon or string.upper(string.sub(self.Title, 1, 1))
+	end
+	self.IconTile.BackgroundTransparency = image and 1 or 0
+	self.IconGradient.Enabled = not image
+	self.IconStroke.Transparency = image and 1 or 0.82
+end
+
+-- icon of the minimized orb (and of the window, unless SetIcon was used):
+-- "rbxassetid://..." = image, any other text = letter or emoji, nil = first letter of the title
 function Window:SetOrbIcon(icon)
 	self.OrbIconValue = icon
-	local isImage = type(icon) == "string" and (
-		string.sub(icon, 1, 13) == "rbxassetid://"
-		or string.sub(icon, 1, 9) == "rbxasset:"
-		or string.sub(icon, 1, 4) == "http"
-	)
-	if isImage then
+	if isImageId(icon) then
 		self.OrbIcon.Image = icon
 		self.OrbIcon.Visible = true
 		self.Orb.Text = ""
@@ -878,19 +1226,39 @@ function Window:SetOrbIcon(icon)
 		self.OrbIcon.Image = ""
 		self.Orb.Text = (type(icon) == "string" and icon ~= "") and icon or string.upper(string.sub(self.Title, 1, 1))
 	end
+	self:_refreshIcon()
 end
 
+-- icon in the top-right corner of the window only (nil = follow OrbIcon)
+function Window:SetIcon(icon)
+	self.IconValue = icon
+	self._customIcon = icon ~= nil
+	self:_refreshIcon()
+end
+
+function Window:SetTitle(text)
+	self.Title = tostring(text or "")
+	self.TitleLabel.Text = self.Title
+	self:SetOrbIcon(self.OrbIconValue)
+end
+
+-- un-minimize: the window grows back out of the orb
 function Window:Show()
 	if self.Visible or self.Destroyed then
 		return
 	end
 	self.Visible = true
-	self.Holder.Visible = true
-	play(self.Scale, T.Smooth, { Scale = 1 })
-	play(self.Canvas, T.Smooth, { GroupTransparency = 0 })
-	setShadow(self.Shadow, self.Palette, true, T.Smooth)
-	play(self.OrbScale, T.In, { Scale = 0 })
-	task.delay(0.26, function()
+	local holder = self.Holder
+	if not holder.Visible then
+		apply(holder, { Position = self.Orb.Position, Visible = true })
+		apply(self.Scale, { Scale = 0.14 })
+		apply(self.Canvas, { GroupTransparency = 1 })
+	end
+	play(holder, Sp.Window, { Position = self._restPosition or UDim2.fromScale(0.5, 0.5) })
+	play(self.Scale, Sp.Window, { Scale = 1 })
+	play(self.Canvas, Sp.Fade, { GroupTransparency = 0 })
+	setShadow(self.Shadow, self.Palette, true, Sp.Fade)
+	play(self.OrbScale, Sp.Close, { Scale = 0 }, function()
 		if self.Visible and self.Orb.Parent then
 			self.Orb.Visible = false
 		end
@@ -901,19 +1269,28 @@ function Window:Show()
 	end
 end
 
+-- minimize: the window shrinks into the orb
 function Window:Hide()
 	if not self.Visible or self.Destroyed then
 		return
 	end
 	self.Visible = false
-	play(self.Scale, T.In, { Scale = 0.94 })
-	play(self.Canvas, T.In, { GroupTransparency = 1 })
-	setShadow(self.Shadow, self.Palette, false, T.In)
+	local holder = self.Holder
+	if self.Scale.Scale > 0.9 then
+		self._restPosition = holder.Position
+	end
 	self.Orb.Visible = true
-	play(self.OrbScale, T.Spring, { Scale = 1 })
-	task.delay(0.26, function()
+	play(holder, Sp.Close, { Position = self.Orb.Position })
+	play(self.Scale, Sp.Close, { Scale = 0.14 })
+	setShadow(self.Shadow, self.Palette, false, Sp.Fade)
+	play(self.Canvas, Sp.Fade, { GroupTransparency = 1 }, function()
 		if not self.Visible and not self.Destroyed then
-			self.Holder.Visible = false
+			holder.Visible = false
+		end
+	end)
+	task.delay(0.09, function()
+		if not self.Visible and not self.Destroyed then
+			play(self.OrbScale, Sp.Pop, { Scale = 1 })
 		end
 	end)
 	blurUsers[self] = nil
@@ -929,15 +1306,15 @@ function Window:Toggle()
 end
 
 function Window:ToggleZoom()
-	if self.Destroyed then
+	if self.Destroyed or not self.Visible then
 		return
 	end
 	self.Zoomed = not self.Zoomed
 	if self.Zoomed then
 		self.PreviousPosition = self.Holder.Position
-		play(self.Holder, T.Smooth, { Size = self.ZoomSize, Position = UDim2.fromScale(0.5, 0.5) })
+		play(self.Holder, Sp.Smooth, { Size = self.ZoomSize, Position = UDim2.fromScale(0.5, 0.5) })
 	else
-		play(self.Holder, T.Smooth, {
+		play(self.Holder, Sp.Smooth, {
 			Size = self.BaseSize,
 			Position = self.PreviousPosition or UDim2.fromScale(0.5, 0.5),
 		})
@@ -957,6 +1334,7 @@ function Window:Destroy()
 		return
 	end
 	self.Destroyed = true
+	local wasVisible = self.Visible
 	self.Visible = false
 	blurUsers[self] = nil
 	refreshBlur()
@@ -964,12 +1342,16 @@ function Window:Destroy()
 		connection:Disconnect()
 	end
 	self.Connections = {}
-	play(self.Scale, T.In, { Scale = 0.9 })
-	play(self.Canvas, T.In, { GroupTransparency = 1 })
-	setShadow(self.Shadow, self.Palette, false, T.In)
-	task.delay(0.3, function()
+	if wasVisible then
+		play(self.Scale, Sp.Close, { Scale = 0.92 })
+		play(self.Canvas, Sp.Fade, { GroupTransparency = 1 })
+		setShadow(self.Shadow, self.Palette, false, Sp.Fade)
+		task.delay(0.28, function()
+			self.Gui:Destroy()
+		end)
+	else
 		self.Gui:Destroy()
-	end)
+	end
 end
 
 --------------------------------------------------------------------------------
@@ -1104,7 +1486,8 @@ function Window:SelectTab(tab, instant)
 
 	-- sliding pill
 	local y = (tab.Index - 1) * TAB_STRIDE
-	play(self.Pill, (not instant) and T.Smooth or nil, { Position = UDim2.fromOffset(0, y) })
+	self.Pill.Visible = true
+	play(self.Pill, (not instant) and Sp.Soft or nil, { Position = UDim2.fromOffset(0, y) })
 
 	-- header
 	self.Header.Text = tab.Name
@@ -1116,8 +1499,7 @@ function Window:SelectTab(tab, instant)
 	-- pages
 	if previous then
 		local old = previous._page
-		play(old, T.Fast, { GroupTransparency = 1, Position = UDim2.fromOffset(0, -8) })
-		task.delay(0.18, function()
+		play(old, Sp.Fade, { GroupTransparency = 1, Position = UDim2.fromOffset(0, -8) }, function()
 			if self.ActiveTab ~= previous then
 				old.Visible = false
 			end
@@ -1130,7 +1512,7 @@ function Window:SelectTab(tab, instant)
 		apply(page, { GroupTransparency = 0, Position = UDim2.fromOffset(0, 0) })
 	else
 		apply(page, { GroupTransparency = 1, Position = UDim2.fromOffset(0, 14) })
-		play(page, T.Smooth, { GroupTransparency = 0, Position = UDim2.fromOffset(0, 0) })
+		play(page, Sp.Smooth, { GroupTransparency = 0, Position = UDim2.fromOffset(0, 0) })
 	end
 end
 
@@ -1178,13 +1560,13 @@ local function hoverable(card, pal, pressable)
 	if pressable then
 		local scale = create("UIScale", { Parent = card })
 		card.MouseButton1Down:Connect(function()
-			play(scale, T.Fast, { Scale = 0.985 })
+			play(scale, Sp.Snappy, { Scale = 0.985 })
 		end)
 		card.MouseButton1Up:Connect(function()
-			play(scale, T.Spring, { Scale = 1 })
+			play(scale, Sp.Snappy, { Scale = 1 })
 		end)
 		card.MouseLeave:Connect(function()
-			play(scale, T.Fast, { Scale = 1 })
+			play(scale, Sp.Snappy, { Scale = 1 })
 		end)
 	end
 end
@@ -1430,7 +1812,7 @@ function Tab:Toggle(config)
 			BackgroundColor3 = toggle.Value and onColor or pal.Off,
 			BackgroundTransparency = toggle.Value and 0 or pal.OffTransparency,
 		}
-		play(knob, animate and T.Spring or nil, knobProps)
+		play(knob, animate and Sp.Snappy or nil, knobProps)
 		play(track, animate and T.Smooth or nil, trackProps)
 	end
 	render(false)
@@ -1572,21 +1954,21 @@ function Tab:Slider(config)
 	end
 
 	function slider:Set(value, silent)
-		commit(value, T.Smooth, silent)
+		commit(value, Sp.Smooth, silent)
 	end
 
 	local dragging = false
 	local function fromPointer(x)
 		local width = math.max(track.AbsoluteSize.X, 1)
 		local rel = math.clamp((x - track.AbsolutePosition.X) / width, 0, 1)
-		commit(min + (max - min) * rel, T.Drag, false)
+		commit(min + (max - min) * rel, nil, false)
 	end
 
 	hit.InputBegan:Connect(function(input)
 		if isPointer(input) then
 			dragging = true
 			self._scroll.ScrollingEnabled = false
-			play(knob, T.Fast, { Size = UDim2.fromOffset(20, 20) })
+			play(knob, Sp.Snappy, { Size = UDim2.fromOffset(20, 20) })
 			fromPointer(input.Position.X)
 		end
 	end)
@@ -1599,7 +1981,7 @@ function Tab:Slider(config)
 		if dragging and isPointer(input) then
 			dragging = false
 			self._scroll.ScrollingEnabled = true
-			play(knob, T.Spring, { Size = UDim2.fromOffset(16, 16) })
+			play(knob, Sp.Snappy, { Size = UDim2.fromOffset(16, 16) })
 		end
 	end)
 
@@ -1672,7 +2054,7 @@ function Tab:Dropdown(config)
 	local function resize()
 		list.Size = UDim2.new(1, -12, 0, listHeight())
 		local target = dropdown.Open and (HEADER + listHeight() + 8) or HEADER
-		play(card, T.Smooth, { Size = UDim2.new(1, 0, 0, target) })
+		play(card, Sp.Smooth, { Size = UDim2.new(1, 0, 0, target) })
 	end
 
 	local function paint()
@@ -1690,7 +2072,7 @@ function Tab:Dropdown(config)
 
 	local function setOpen(state)
 		dropdown.Open = state
-		play(arrow, T.Smooth, { Rotation = state and 90 or 0 })
+		play(arrow, Sp.Smooth, { Rotation = state and 90 or 0 })
 		resize()
 	end
 
@@ -1908,6 +2290,7 @@ function Tab:Keybind(config)
 
 	button.MouseButton1Click:Connect(function()
 		listening = true
+		window._capturing = true
 		render()
 	end)
 
@@ -1915,15 +2298,20 @@ function Tab:Keybind(config)
 		if listening then
 			if input.UserInputType == Enum.UserInputType.Keyboard then
 				listening = false
+				task.defer(function()
+					window._capturing = false
+				end)
 				if input.KeyCode == Enum.KeyCode.Escape then
 					render()
+				elseif input.KeyCode == Enum.KeyCode.Backspace then
+					keybind:Set(nil)
 				else
 					keybind:Set(input.KeyCode)
 				end
 			end
 			return
 		end
-		if not processed and keybind.Value and input.KeyCode == keybind.Value then
+		if not processed and not window._capturing and keybind.Value and input.KeyCode == keybind.Value then
 			task.spawn(safe, config.Callback)
 		end
 	end)
